@@ -3,9 +3,12 @@ import json
 import re
 import base64
 import binascii
+import time
+import random
 from urllib.parse import urlparse, parse_qs, urlencode
 import urllib.request
 import urllib.error
+import http.cookiejar
 import ssl
 
 HEADERS = {
@@ -23,72 +26,58 @@ CTX = ssl.create_default_context()
 CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
 
-SHORTENER_DOMAINS = [
-    "sfl.gl", "safelink", "safelinku", "khaddavi", "comun.id",
-    "bit.ly", "tinyurl", "shorturl", "s.id", "tiny.cc",
-    "rebrand.ly", "cutt.ly", "shorte.st", "adf.ly",
-]
 
-ASSET_BLACKLIST = [
-    # CDN & infra
-    "google", "gstatic", "cloudflare", "cdn.",
-    "googleapis", "googleusercontent",
-    "jquery", "bootstrap", "fontawesome", "js-cookie",
-    "github.com", "githubusercontent", "npmjs", "unpkg",
-    "cdnjs", "jsdelivr",
-    # Analytics
-    "analytics", "doubleclick", "facebook", "twitter",
-    "whatsapp", "schema.org", "gtag", "gtm",
-    # WP
-    "w.org", "wp.com", "wp-rocket", "wp-rocket.me",
-    "gravatar", "generatepress", "wordpress.org",
-    "wordpress.com", "themeforest", "elementor",
-    # XML / RSS namespace
-    "w3.org", "purl.org", "xmlns.com", "ogp.me",
-    # Theme / framework
-    "pleask.page", "pleask",
-    # Artikel/sidebar
-    "yoast.com", "yoast", "khanacademy", "tocaboca",
-    "tender-lamarr", "semrush", "moz.com", "ahrefs",
-    # Sosmed
-    "t.me", "telegram", "instagram", "youtube", "tiktok",
-    "linkedin", "pinterest", "reddit",
-]
+# ============================================================
+# HTTP CLIENT — dengan cookie jar (buat /api/session + /api/go)
+# ============================================================
+class HttpClient:
+    def __init__(self):
+        self.cj = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cj),
+            urllib.request.HTTPSHandler(context=CTX),
+        )
 
+    def get(self, url, headers=None, timeout=20):
+        h = dict(HEADERS)
+        if headers:
+            h.update(headers)
+        req = urllib.request.Request(url, headers=h)
+        try:
+            with self.opener.open(req, timeout=timeout) as r:
+                return r.status, r.geturl(), r.read().decode("utf-8", "ignore")
+        except urllib.error.HTTPError as e:
+            return e.code, url, e.read().decode("utf-8", "ignore")
+        except Exception as e:
+            return 0, url, f"ERROR: {e}"
 
-def http_get(url, timeout=20):
-    req = urllib.request.Request(url, headers=HEADERS)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
-            return r.status, r.geturl(), r.read().decode("utf-8", "ignore")
-    except urllib.error.HTTPError as e:
-        return e.code, url, e.read().decode("utf-8", "ignore")
-    except Exception as e:
-        return 0, url, f"ERROR: {e}"
-
-
-def http_post(url, data, timeout=20):
-    body = urlencode(data).encode()
-    req = urllib.request.Request(url, data=body, headers=HEADERS, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
-            return r.status, r.geturl(), r.read().decode("utf-8", "ignore")
-    except urllib.error.HTTPError as e:
-        return e.code, url, e.read().decode("utf-8", "ignore")
-    except Exception as e:
-        return 0, url, f"ERROR: {e}"
+    def post(self, url, data=None, json_data=None, headers=None, timeout=20):
+        h = dict(HEADERS)
+        h["Content-Type"] = "application/json"
+        if headers:
+            h.update(headers)
+        if json_data is not None:
+            body = json.dumps(json_data).encode()
+        elif isinstance(data, dict):
+            body = urlencode(data).encode()
+        else:
+            body = (data or "").encode()
+        req = urllib.request.Request(url, data=body, headers=h, method="POST")
+        try:
+            with self.opener.open(req, timeout=timeout) as r:
+                return r.status, r.geturl(), r.read().decode("utf-8", "ignore")
+        except urllib.error.HTTPError as e:
+            return e.code, url, e.read().decode("utf-8", "ignore")
+        except Exception as e:
+            return 0, url, f"ERROR: {e}"
 
 
+# ============================================================
+# UTILS
+# ============================================================
 def b64_decode(s):
     try:
         return base64.b64decode(s + "=" * (-len(s) % 4)).decode("utf-8", "ignore")
-    except Exception:
-        return None
-
-
-def hex_decode(s):
-    try:
-        return binascii.unhexlify(s).decode("utf-8", "ignore")
     except Exception:
         return None
 
@@ -97,185 +86,70 @@ def extract_urls(text):
     return re.findall(r'https?://[^\s"\'<>\\]+', text)
 
 
-def is_shortener(url):
-    return any(d in url.lower() for d in SHORTENER_DOMAINS)
-
-
-def is_asset(url):
-    return any(d in url.lower() for d in ASSET_BLACKLIST)
-
-
 def has_fragment(url):
-    """Skip URL dengan #fragment (anchor)."""
     return "#" in url
 
 
-def is_candidate(url):
-    if is_shortener(url):
-        return False
-    if is_asset(url):
-        return False
-    if has_fragment(url):
-        return False
-    # Skip URL yang bukan http
-    if not url.startswith("http"):
-        return False
-    return True
-
-
 # ============================================================
-# M2() DECODER
+# CORE: PANGGIL /api/go DARI HALAMAN KHADDAVI
 # ============================================================
-def decode_m2(html):
-    m = re.search(r"M2\s*\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)", html)
-    if not m:
-        m = re.search(r'M2\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\)', html)
-    if not m:
-        return None
+def try_api_go(html_page_url, client, logs):
+    """
+    Dari halaman khaddavi, panggil /api/go untuk dapet URL target.
+    """
+    parsed = urlparse(html_page_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
 
-    payload = m.group(1)
-    key = m.group(2)
+    # 1. POST /api/session — inisialisasi session
+    # Butuh _token dari cookie XSRF-TOKEN. Coba pake token dummy + fingerprint
+    fingerprint = f"webgl:Google Inc.|audio:0.123456|canvas:abc123|fonts:24/24|system:{random.randint(2,16)}CPU"
+    token = f"{int(time.time())}{random.randint(1000000, 9999999)}"
+
+    session_url = f"{base}/api/session"
+    st, fu, body = client.post(session_url, json_data={"_token": token})
+    logs.append(f"  POST {session_url} -> {st}")
+
+    step = 1
+    try:
+        j = json.loads(body)
+        step = j.get("step", 1)
+        logs.append(f"  session step={step}, captcha={j.get('captcha')}")
+    except Exception:
+        logs.append(f"  session body: {body[:200]}")
+
+    # 2. POST /api/go — ambil URL target
+    key = random.randint(1, 999)
+    size = f"{random.randint(700, 1400)}.{random.randint(1200, 2200)}"
+    go_url = f"{base}/api/go"
+    st, fu, body = client.post(go_url, json_data={"key": key, "size": size, "ado": None})
+    logs.append(f"  POST {go_url} -> {st}")
 
     try:
-        half = len(key) // 2
-        sub_a = key[:half]
-        sub_b = key[half:]
+        j = json.loads(body)
+        url = j.get("url") or j.get("target") or j.get("link")
+        if url:
+            logs.append(f"  FINAL (api/go): {url}")
+            return url
+        logs.append(f"  api/go response: {json.dumps(j)[:200]}")
+    except Exception:
+        logs.append(f"  api/go body: {body[:200]}")
 
-        decoded_chars = []
-        for ch in payload:
-            idx = sub_b.find(ch)
-            if idx != -1 and idx < len(sub_a):
-                decoded_chars.append(sub_a[idx])
-            else:
-                decoded_chars.append(ch)
+    # 3. Fallback: POST /api/verify
+    verify_url = f"{base}/api/verify"
+    st, fu, body = client.post(verify_url, json_data={"_a": 0})
+    logs.append(f"  POST {verify_url} -> {st}")
+    try:
+        j = json.loads(body)
+        url = j.get("target") or j.get("url")
+        if url:
+            logs.append(f"  FINAL (api/verify): {url}")
+            return url
+    except Exception:
+        pass
 
-        decoded_json = "".join(decoded_chars)
-        return json.loads(decoded_json)
-    except Exception as e:
-        return {"_error": str(e)}
-
-
-def decode_obfuscated_string(s):
-    replacements = {
-        "lppvs": "https",
-        "rym": "com",
-        "rnz": "net",
-        "uvn3": "info",
-    }
-    for k, v in replacements.items():
-        s = s.replace(k, v)
-    return s
-
-
-def extract_from_m2(html):
-    data = decode_m2(html)
-    if not data or not isinstance(data, dict):
-        return None
-
-    for k, v in data.items():
-        if k.startswith("5np") or "rot" in k.lower():
-            if isinstance(v, str) and ("http" in v or "lppvs" in v):
-                return v
-
-    for k, v in data.items():
-        if isinstance(v, str) and ("http" in v or "lppvs" in v):
-            return v
     return None
 
 
-def extract_m2_field_raw(html):
-    patterns = [
-        r'["\']5np_?c5a["\']\s*[:=]\s*["\']([^"\']+)["\']',
-        r'5np_?c5a["\']?\s*:\s*["\']([^"\']+)["\']',
-    ]
-    for p in patterns:
-        m = re.search(p, html)
-        if m:
-            return m.group(1)
-    return None
-
-
-# ============================================================
-# FINDERS
-# ============================================================
-def find_all_hidden(html):
-    results = []
-
-    for blob in re.findall(r'[A-Za-z0-9+/=]{30,}', html):
-        dec = b64_decode(blob)
-        if dec and "http" in dec:
-            results.extend(extract_urls(dec))
-
-    for blob in re.findall(r'[0-9a-fA-F]{30,}', html):
-        dec = hex_decode(blob)
-        if dec and "http" in dec:
-            results.extend(extract_urls(dec))
-
-    for m in re.findall(r'(?:var|let|const)\s+\w+\s*=\s*["\'](https?://[^"\']+)["\']', html):
-        results.append(m)
-
-    for m in re.findall(
-        r'["\'](?:url|link|target|redirect|destination|href|real_url|final_url)["\']\s*:\s*["\'](https?://[^"\']+)["\']',
-        html, re.I
-    ):
-        results.append(m)
-
-    for m in re.findall(
-        r'data-(?:url|href|link|target|redirect|dest|real)=["\'](https?://[^"\']+)["\']',
-        html, re.I
-    ):
-        results.append(m)
-
-    for m in re.findall(
-        r'<meta[^>]+content=["\']\d+;\s*url=(https?://[^"\']+)["\']',
-        html, re.I
-    ):
-        results.append(m)
-
-    for m in re.findall(r'<a[^>]+href=["\'](https?://[^"\']+)["\']', html, re.I):
-        results.append(m)
-
-    seen = set()
-    final = []
-    for u in results:
-        if u not in seen:
-            seen.add(u)
-            final.append(u)
-    return final
-
-
-def find_step_endpoints(html):
-    endpoints = []
-    for m in re.findall(r'(?:fetch|\.ajax|\.get|\.post|axios\.\w+)\s*\(\s*["\']([^"\']+)["\']', html):
-        endpoints.append(m)
-    for m in re.findall(r'<form[^>]+action=["\']([^"\']+)["\']', html, re.I):
-        endpoints.append(m)
-    for m in re.findall(r'["\'](/[a-z0-9_\-]+/[a-z0-9_\-/]+)["\']', html, re.I):
-        if any(k in m.lower() for k in ["api", "go", "step", "link", "redirect", "get", "ready"]):
-            endpoints.append(m)
-    for m in re.findall(r'["\'](https?://[^"\']*?/(?:go|ready|redirect|link|get)[^"\']*)["\']', html, re.I):
-        endpoints.append(m)
-    return list(set(endpoints))
-
-
-def find_tokens(html):
-    tokens = {}
-    for m in re.findall(
-        r'<input[^>]+name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']',
-        html, re.I
-    ):
-        tokens[m[0]] = m[1]
-    for m in re.findall(
-        r'["\'](?:token|csrf|_token|key|nonce)["\']\s*:\s*["\']([^"\']+)["\']',
-        html, re.I
-    ):
-        tokens["_js_token"] = m
-    return tokens
-
-
-# ============================================================
-# CORE BYPASS
-# ============================================================
 def bypass(url, depth=0, max_depth=4, visited=None):
     if visited is None:
         visited = set()
@@ -289,13 +163,14 @@ def bypass(url, depth=0, max_depth=4, visited=None):
         return {"success": False, "error": "Max depth reached", "url": url, "logs": []}
 
     logs = []
+    client = HttpClient()
 
     def log(m):
         logs.append("  " * depth + str(m))
 
     log(f"[d={depth}] {url}")
 
-    status, final_url, html = http_get(url)
+    status, final_url, html = client.get(url)
     log(f"HTTP {status} -> {final_url}")
 
     if status == 0:
@@ -303,124 +178,46 @@ def bypass(url, depth=0, max_depth=4, visited=None):
 
     log(f"HTML: {len(html)} bytes")
 
+    parsed = urlparse(final_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+
     # === PRIORITAS 1: window.location.href ===
-    loc_match = re.search(
-        r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']',
-        html
-    )
+    loc_match = re.search(r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']', html)
     if loc_match:
         target = loc_match.group(1).replace("\\/", "/")
-        if target.startswith("http") and not is_asset(target):
-            log(f"FINAL (window.location.href): {target}")
+        if target.startswith("http") and "sfl.gl" not in target and "khaddavi" not in target:
+            log(f"FINAL (window.location): {target}")
             return {"success": True, "url": target, "method": "window-location", "logs": logs}
 
-    # === PRIORITAS 1.5: M2 payload ===
-    m2_url = extract_from_m2(html)
-    if m2_url:
-        clean = re.sub(r'\[[^\]]+\]', '', m2_url)
-        decoded = decode_obfuscated_string(clean)
-        if decoded.startswith("http"):
-            log(f"FINAL (M2 decode): {decoded}")
-            return {"success": True, "url": decoded, "method": "m2-decode", "logs": logs}
-    else:
-        log("M2() tidak ada")
+    # === PRIORITAS 2: Kalau halaman khaddavi, panggil /api/go ===
+    if "khaddavi" in final_url.lower():
+        log("Halaman khaddavi terdeteksi, coba /api/go...")
+        api_url = try_api_go(final_url, client, logs)
+        if api_url:
+            return {"success": True, "url": api_url, "method": "api-go", "logs": logs}
 
-    raw_rot = extract_m2_field_raw(html)
-    if raw_rot:
-        clean = raw_rot.replace("\\/", "/")
-        clean = re.sub(r'\[[^\]]+\]', '', clean)
-        decoded = decode_obfuscated_string(clean)
-        if decoded.startswith("http"):
-            log(f"FINAL (rot field): {decoded}")
-            return {"success": True, "url": decoded, "method": "rot-field", "logs": logs}
-
-    # === PRIORITAS 2: redirect final ===
-    if final_url != url and not is_shortener(final_url) and not is_asset(final_url) and not has_fragment(final_url):
+    # === PRIORITAS 3: redirect final ===
+    if final_url != url and "sfl.gl" not in final_url and "khaddavi" not in final_url:
         log(f"FINAL via redirect: {final_url}")
         return {"success": True, "url": final_url, "method": "redirect-final", "logs": logs}
 
-    # === PRIORITAS 3: JS var ===
-    for pattern in [
-        r'location\.replace\(["\'](https?:[^"\']+)["\']\)',
-        r'location\.assign\(["\'](https?:[^"\']+)["\']\)',
-    ]:
-        m = re.search(pattern, html, re.I)
-        if m:
-            js_target = m.group(1).replace("\\/", "/")
-            if js_target.startswith("http") and not is_asset(js_target):
-                log(f"FINAL (JS var): {js_target}")
-                return {"success": True, "url": js_target, "method": "js-var", "logs": logs}
-
-    # === PRIORITAS 4: URL final di HTML ===
+    # === PRIORITAS 4: Rekursif — shortener lain ===
     all_urls = extract_urls(html.replace("\\/", "/"))
-    final_candidates = [u for u in all_urls if is_candidate(u)]
-    if final_candidates:
-        log(f"Kandidat final: {final_candidates[0]}")
-        return {"success": True, "url": final_candidates[0], "method": "html-url",
-                "candidates": final_candidates[:5], "logs": logs}
-
-    # === PRIORITAS 5: rekursif shortener (HANYA domain shortener, bukan fragment) ===
-    shorteners_in_html = []
-    for u in all_urls:
-        if not is_shortener(u):
-            continue
-        if u in visited or u == url:
-            continue
-        if has_fragment(u):
-            continue
-        # skip redirect.php yang sama
-        if "redirect.php" in u and "redirect.php" in url:
-            continue
-        shorteners_in_html.append(u)
-
-    for s in shorteners_in_html[:2]:
-        log(f"Shortener lain: {s}, rekursif...")
+    shorteners = [
+        u for u in all_urls
+        if ("sfl.gl" in u or "khaddavi" in u or "redirect.php" in u)
+        and u not in visited
+        and u != url
+        and not has_fragment(u)
+    ]
+    for s in shorteners[:2]:
+        log(f"Rekursif: {s}")
         sub = bypass(s, depth + 1, max_depth, visited)
         if sub.get("success"):
             sub["logs"] = logs + sub.get("logs", [])
             return sub
 
-    # === PRIORITAS 6: endpoint POST/GET ===
-    endpoints = find_step_endpoints(html)
-    tokens = find_tokens(html)
-    log(f"Endpoints: {endpoints}")
-
-    base = f"{urlparse(final_url).scheme}://{urlparse(final_url).netloc}"
-
-    for ep in endpoints[:8]:
-        full = ep if ep.startswith("http") else base + ep
-        for method in ("POST", "GET"):
-            try:
-                if method == "POST":
-                    st, fu, txt = http_post(full, tokens)
-                else:
-                    st, fu, txt = http_get(full + ("?" + urlencode(tokens) if tokens else ""))
-                log(f"{method} {full} -> {st} -> {fu}")
-
-                loc_m = re.search(r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']', txt)
-                if loc_m:
-                    target = loc_m.group(1).replace("\\/", "/")
-                    if target.startswith("http") and not is_asset(target):
-                        return {"success": True, "url": target, "method": f"{method}-window-location", "logs": logs}
-
-                m2_sub = extract_from_m2(txt)
-                if m2_sub:
-                    clean = re.sub(r'\[[^\]]+\]', '', m2_sub)
-                    decoded = decode_obfuscated_string(clean)
-                    if decoded.startswith("http"):
-                        return {"success": True, "url": decoded, "method": f"{method}-m2", "logs": logs}
-
-                if fu != final_url and not is_shortener(fu) and not is_asset(fu) and not has_fragment(fu):
-                    return {"success": True, "url": fu, "method": f"{method}-redirect", "logs": logs}
-
-                found = [u for u in extract_urls(txt.replace("\\/", "/")) if is_candidate(u)]
-                if found:
-                    return {"success": True, "url": found[0], "method": f"{method}-body",
-                            "candidates": found[:5], "logs": logs}
-            except Exception as e:
-                log(f"{method} err: {e}")
-
-    return {"success": False, "error": "Gagal detect", "logs": logs, "endpoints": endpoints}
+    return {"success": False, "error": "Gagal detect", "logs": logs}
 
 
 class handler(BaseHTTPRequestHandler):
