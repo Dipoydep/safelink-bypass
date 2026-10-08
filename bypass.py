@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
+"""
+Safelink Bypass - Termux Edition
+Jalan di Termux, pake IP HP -> lolos Cloudflare.
+"""
 import sys
 import json
 import re
+import time
+import random
+import base64
 import requests
 
 HEADERS = {
@@ -25,13 +32,60 @@ def fetch(url, session=None, allow_redirects=True):
         return 0, url, f"ERROR: {e}"
 
 
-def post(url, session=None, json_data=None):
+def post(url, session=None, json_data=None, data=None):
     s = session or requests.Session()
     try:
-        r = s.post(url, headers=HEADERS, timeout=20, json=json_data)
+        r = s.post(url, headers=HEADERS, timeout=20, json=json_data, data=data)
         return r.status_code, r.url, r.text
     except Exception as e:
         return 0, url, f"ERROR: {e}"
+
+
+def build_token(session, html, verbose=True):
+    """Bikin _token = XSRF-TOKEN + '#' + base64(fingerprint)."""
+    def log(msg):
+        if verbose:
+            print(msg)
+
+    # Ambil XSRF-TOKEN dari cookie
+    xsrf = None
+    for c in session.cookies:
+        if c.name == "XSRF-TOKEN":
+            xsrf = c.value
+            break
+
+    if xsrf:
+        log(f"[4] XSRF-TOKEN: {xsrf[:40]}...")
+    else:
+        log(f"[4] XSRF-TOKEN gak ada di cookie, cari di HTML")
+        m = re.search(r'name="csrf-token"\s+content="([^"]+)"', html)
+        if m:
+            xsrf = m.group(1)
+            log(f"    Ketemu di meta: {xsrf[:40]}...")
+        else:
+            log(f"    XSRF-TOKEN gak ketemu sama sekali")
+            xsrf = ""
+
+    # Bikin fingerprint sederhana
+    fp_parts = [
+        f"webgl:Google|{random.randint(100, 999)}",
+        f"audio:{random.random():.12f}",
+        f"canvas:abc{random.randint(100, 999)}",
+        f"fonts:24/24",
+        f"system:{random.randint(2, 16)}CPU",
+    ]
+    fingerprint = "||".join(fp_parts)
+    fp_b64 = base64.b64encode(fingerprint.encode()).decode()
+
+    # _token = xsrf + "#" + fp_b64 (dipotong sampe 128 karakter)
+    if xsrf:
+        max_xsrf_len = max(0, 128 - len(fp_b64) - 1)
+        token = xsrf[:max_xsrf_len] + "#" + fp_b64
+    else:
+        token = "#" + fp_b64
+
+    log(f"[5] _token: {token[:60]}...")
+    return token
 
 
 def bypass_safelink(url, verbose=True):
@@ -46,41 +100,54 @@ def bypass_safelink(url, verbose=True):
     status, final_url, html = fetch(url, session)
     log(f"[1] HTTP {status} -> {final_url}")
 
+    if "Attention Required" in html or "cf-browser-verification" in html:
+        return {"success": False, "error": "Cloudflare block", "url": url}
+
     # STEP 2: Cari redirect.php
     rp_match = re.search(r'["\'](https?://[^"\']*?/redirect\.php[^"\']*)["\']', html)
-    rp_url = rp_match.group(1) if rp_match else None
+    rp_url = rp_match.group(1) if rp_match else "https://app.khaddavi.net/redirect.php"
+    log(f"[2] redirect.php: {rp_url}")
 
-    if rp_url:
-        log(f"[2] redirect.php: {rp_url}")
-        status, kh_url, kh_html = post(rp_url, session, json_data={"_a": 0})
-        log(f"[3] POST redirect.php -> {status} -> {kh_url}")
-    else:
-        log("[2] redirect.php gak ketemu, coba fetch ulang")
-        kh_url = final_url
-        kh_html = html
+    # STEP 3: POST redirect.php
+    st, kh_url, kh_html = post(rp_url, session, json_data={"_a": 0})
+    log(f"[3] POST redirect.php -> {st} -> {kh_url}")
 
-    # STEP 3: Parse base domain khaddavi
     if "khaddavi" not in kh_url:
         kh_match = re.search(r'["\'](https?://app\.khaddavi\.net/[^"\']+)["\']', html)
         if kh_match:
             kh_url = kh_match.group(1)
             log(f"[3] khaddavi URL: {kh_url}")
 
-    if "khaddavi" not in kh_url:
+    if not kh_url or "khaddavi" not in kh_url:
         return {"success": False, "error": "Gak dapet khaddavi URL"}
 
+    # Parse base domain
     parsed = re.match(r'(https?://[^/]+)', kh_url)
     base = parsed.group(1) if parsed else "https://app.khaddavi.net"
     log(f"[+] Base: {base}")
 
-    # STEP 4: /api/session
-    st, _, body = post(f"{base}/api/session", session, json_data={"_token": "test"})
-    log(f"[4] /api/session -> {st}")
+    # STEP 3.5: Fetch halaman khaddavi (biar cookie XSRF ke-set)
+    st, _, kh_html = fetch(kh_url, session)
+    log(f"[3.5] Fetch khaddavi -> {st}")
+
+    # Cek cookie session
+    log(f"    Cookies: {[c.name for c in session.cookies]}")
+
+    # STEP 4-5: Bikin _token
+    token = build_token(session, kh_html, verbose)
+
+    # STEP 6: /api/session
+    st, _, body = post(f"{base}/api/session", session, json_data={"_token": token})
+    log(f"[6] /api/session -> {st}")
     log(f"    {body[:200]}")
 
-    # STEP 5: /api/go
-    st, _, body = post(f"{base}/api/go", session, json_data={"key": 1, "size": "1000.2000", "ado": None})
-    log(f"[5] /api/go -> {st}")
+    # STEP 7: /api/go
+    st, _, body = post(
+        f"{base}/api/go",
+        session,
+        json_data={"key": 1, "size": "1000.2000", "ado": None},
+    )
+    log(f"[7] /api/go -> {st}")
     log(f"    {body[:300]}")
 
     # Parse JSON
@@ -88,7 +155,7 @@ def bypass_safelink(url, verbose=True):
         data = json.loads(body)
         target = data.get("url") or data.get("target") or data.get("link")
         if target:
-            log(f"\n[✓] FINAL: {target}")
+            log(f"\n[OK] FINAL: {target}")
             return {"success": True, "url": target, "method": "api-go"}
     except Exception:
         pass
@@ -97,17 +164,24 @@ def bypass_safelink(url, verbose=True):
     urls = re.findall(r'https?://[^\s"\'<>\\]+', body)
     for u in urls:
         if not any(x in u.lower() for x in ["khaddavi", "sfl.gl", "google", "gstatic", "cloudflare", "wp.com", "w.org", "schema"]):
-            log(f"\n[✓] FINAL (fallback): {u}")
+            log(f"\n[OK] FINAL (fallback): {u}")
             return {"success": True, "url": u, "method": "fallback"}
 
-    return {"success": False, "error": "Gak dapet URL target", "go_body": body[:500]}
+    return {
+        "success": False,
+        "error": "Gak dapet URL target",
+        "session_body": body[:300],
+    }
 
 
 def main():
     if len(sys.argv) < 2:
         print("Usage: python bypass.py <safelink_url>")
+        print("Contoh: python bypass.py https://sfl.gl/7vUwMV")
         sys.exit(1)
-    result = bypass_safelink(sys.argv[1])
+
+    target = sys.argv[1]
+    result = bypass_safelink(target)
     print("\n=== HASIL ===")
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
