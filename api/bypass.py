@@ -34,8 +34,10 @@ ASSET_BLACKLIST = [
     "jquery", "bootstrap", "fontawesome", "analytics",
     "doubleclick", "facebook", "twitter", "whatsapp",
     "schema.org", "w.org", "wp.com", "gravatar",
-    "generatepress", "wordpress.org", "themeforest",
-    "elementor", "w3.org", "googleapis",
+    "generatepress", "wordpress.org", "wordpress.com",
+    "themeforest", "elementor", "w3.org", "googleapis",
+    "yoast.com", "yoast", "khanacademy", "tocaboca",
+    "pleask.page", "tender-lamarr",
 ]
 
 
@@ -92,6 +94,80 @@ def is_candidate(url):
     return not is_shortener(url) and not is_asset(url)
 
 
+# ============================================================
+# M2() DECODER — nembus payload obfuscated safelink khaddavi
+# ============================================================
+def decode_m2(html):
+    """Cari dan decode payload M2('data', 'key') dari HTML."""
+    m = re.search(r"M2\s*\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)", html)
+    if not m:
+        m = re.search(r'M2\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\)', html)
+    if not m:
+        return None
+
+    payload = m.group(1)
+    key = m.group(2)
+
+    try:
+        half = len(key) // 2
+        sub_a = key[:half]
+        sub_b = key[half:]
+
+        decoded_chars = []
+        for ch in payload:
+            idx = sub_b.find(ch)
+            if idx != -1 and idx < len(sub_a):
+                decoded_chars.append(sub_a[idx])
+            else:
+                decoded_chars.append(ch)
+
+        decoded_json = "".join(decoded_chars)
+        return json.loads(decoded_json)
+    except Exception as e:
+        return {"_error": str(e)}
+
+
+def extract_from_m2(html):
+    """Ambil rot_url / target URL dari payload M2()."""
+    data = decode_m2(html)
+    if not data or not isinstance(data, dict):
+        return None
+
+    # Cari field rot_url (kode 5np_c5a) atau field apapun yang isinya URL
+    for k, v in data.items():
+        if isinstance(v, str) and v.startswith(("http", "lppvs")) or "\\/\\/" in str(v):
+            v_clean = v.replace("\\/", "/")
+            # Decode manual obfuscated (rot_url biasanya bentuk URL)
+            if v_clean.startswith("http"):
+                return v_clean
+
+    # Fallback: cari value yang mirip URL
+    for k, v in data.items():
+        if isinstance(v, str) and ("http" in v or "lppvs" in v):
+            return v.replace("\\/", "/")
+
+    return None
+
+
+def decode_obfuscated_string(s):
+    """Decode string kayak 'lppvs://...' jadi 'https://...'."""
+    # Obfuscation sederhana: karakter digeser
+    # lppvs = https, rym = com, rnz = net, uv n3 = io ? dll
+    replacements = {
+        "lppvs": "https",
+        "rym": "com",
+        "rnz": "net",
+        "uvn3": "info",
+        "r n3": "io",
+    }
+    for k, v in replacements.items():
+        s = s.replace(k, v)
+    return s
+
+
+# ============================================================
+# FINDERS
+# ============================================================
 def find_all_hidden(html):
     results = []
 
@@ -167,6 +243,9 @@ def find_tokens(html):
     return tokens
 
 
+# ============================================================
+# CORE BYPASS
+# ============================================================
 def bypass(url, depth=0, max_depth=6, visited=None):
     if visited is None:
         visited = set()
@@ -201,9 +280,20 @@ def bypass(url, depth=0, max_depth=6, visited=None):
     )
     if loc_match:
         target = loc_match.group(1).replace("\\/", "/")
-        if target.startswith("http"):
+        if target.startswith("http") and not is_shortener(target) and not is_asset(target):
             log(f"FINAL (window.location.href): {target}")
             return {"success": True, "url": target, "method": "window-location", "logs": logs}
+
+    # === PRIORITAS 1.5: Payload M2() obfuscated ===
+    m2_url = extract_from_m2(html)
+    if m2_url:
+        # Bersihin placeholder [tmx], [zmxal], dll
+        clean = re.sub(r'\[[^\]]+\]', '', m2_url)
+        # Coba decode obfuscated string (lppvs → https)
+        decoded = decode_obfuscated_string(clean)
+        if decoded.startswith("http"):
+            log(f"FINAL (M2 decode): {decoded}")
+            return {"success": True, "url": decoded, "method": "m2-decode", "logs": logs}
 
     # === PRIORITAS 2: redirect final ===
     if final_url != url and not is_shortener(final_url) and not is_asset(final_url):
@@ -223,12 +313,14 @@ def bypass(url, depth=0, max_depth=6, visited=None):
                 log(f"FINAL (JS var): {js_target}")
                 return {"success": True, "url": js_target, "method": "js-var", "logs": logs}
 
-    # === PRIORITAS 4: URL final di HTML ===
+    # === PRIORITAS 4: URL final di HTML (yang bukan asset) ===
     all_urls = extract_urls(html.replace("\\/", "/"))
     final_candidates = [u for u in all_urls if is_candidate(u)]
+    # Filter tambahan: skip URL yang bukan target (biasanya di sidebar)
     if final_candidates:
         log(f"Kandidat final: {final_candidates[0]}")
-        return {"success": True, "url": final_candidates[0], "method": "html-url", "candidates": final_candidates[:5], "logs": logs}
+        return {"success": True, "url": final_candidates[0], "method": "html-url",
+                "candidates": final_candidates[:5], "logs": logs}
 
     # === PRIORITAS 5: rekursif shortener ===
     shorteners_in_html = [u for u in all_urls if is_shortener(u) and u not in visited and u != url]
@@ -262,6 +354,14 @@ def bypass(url, depth=0, max_depth=6, visited=None):
                     if target.startswith("http"):
                         return {"success": True, "url": target, "method": f"{method}-window-location", "logs": logs}
 
+                # Cek M2 di response body
+                m2_sub = extract_from_m2(txt)
+                if m2_sub:
+                    clean = re.sub(r'\[[^\]]+\]', '', m2_sub)
+                    decoded = decode_obfuscated_string(clean)
+                    if decoded.startswith("http"):
+                        return {"success": True, "url": decoded, "method": f"{method}-m2", "logs": logs}
+
                 if fu != final_url and not is_shortener(fu) and not is_asset(fu):
                     return {"success": True, "url": fu, "method": f"{method}-redirect", "logs": logs}
 
@@ -273,7 +373,8 @@ def bypass(url, depth=0, max_depth=6, visited=None):
 
                 found = [u for u in extract_urls(txt.replace("\\/", "/")) if is_candidate(u)]
                 if found:
-                    return {"success": True, "url": found[0], "method": f"{method}-body", "candidates": found[:5], "logs": logs}
+                    return {"success": True, "url": found[0], "method": f"{method}-body",
+                            "candidates": found[:5], "logs": logs}
             except Exception as e:
                 log(f"{method} err: {e}")
 
