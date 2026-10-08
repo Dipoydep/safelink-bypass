@@ -30,19 +30,27 @@ SHORTENER_DOMAINS = [
 ]
 
 ASSET_BLACKLIST = [
+    # CDN & infra
     "google", "gstatic", "cloudflare", "cdn.",
     "googleapis", "googleusercontent",
     "jquery", "bootstrap", "fontawesome", "js-cookie",
     "github.com", "githubusercontent", "npmjs", "unpkg",
     "cdnjs", "jsdelivr",
+    # Analytics
     "analytics", "doubleclick", "facebook", "twitter",
     "whatsapp", "schema.org", "gtag", "gtm",
+    # WP
     "w.org", "wp.com", "wp-rocket", "wp-rocket.me",
     "gravatar", "generatepress", "wordpress.org",
     "wordpress.com", "themeforest", "elementor",
-    "w3.org", "pleask.page", "pleask",
+    # XML / RSS namespace
+    "w3.org", "purl.org", "xmlns.com", "ogp.me",
+    # Theme / framework
+    "pleask.page", "pleask",
+    # Artikel/sidebar
     "yoast.com", "yoast", "khanacademy", "tocaboca",
     "tender-lamarr", "semrush", "moz.com", "ahrefs",
+    # Sosmed
     "t.me", "telegram", "instagram", "youtube", "tiktok",
     "linkedin", "pinterest", "reddit",
 ]
@@ -97,8 +105,22 @@ def is_asset(url):
     return any(d in url.lower() for d in ASSET_BLACKLIST)
 
 
+def has_fragment(url):
+    """Skip URL dengan #fragment (anchor)."""
+    return "#" in url
+
+
 def is_candidate(url):
-    return not is_shortener(url) and not is_asset(url)
+    if is_shortener(url):
+        return False
+    if is_asset(url):
+        return False
+    if has_fragment(url):
+        return False
+    # Skip URL yang bukan http
+    if not url.startswith("http"):
+        return False
+    return True
 
 
 # ============================================================
@@ -134,7 +156,6 @@ def decode_m2(html):
 
 
 def decode_obfuscated_string(s):
-    """Convert string obfuscated jadi URL."""
     replacements = {
         "lppvs": "https",
         "rym": "com",
@@ -151,13 +172,11 @@ def extract_from_m2(html):
     if not data or not isinstance(data, dict):
         return None
 
-    # Prioritas: cari rot_url (5np_c5a)
     for k, v in data.items():
         if k.startswith("5np") or "rot" in k.lower():
             if isinstance(v, str) and ("http" in v or "lppvs" in v):
                 return v
 
-    # Fallback: URL apapun di data
     for k, v in data.items():
         if isinstance(v, str) and ("http" in v or "lppvs" in v):
             return v
@@ -165,7 +184,6 @@ def extract_from_m2(html):
 
 
 def extract_m2_field_raw(html):
-    """Cari field 5np_c5a langsung (rot_url) di HTML."""
     patterns = [
         r'["\']5np_?c5a["\']\s*[:=]\s*["\']([^"\']+)["\']',
         r'5np_?c5a["\']?\s*:\s*["\']([^"\']+)["\']',
@@ -258,7 +276,7 @@ def find_tokens(html):
 # ============================================================
 # CORE BYPASS
 # ============================================================
-def bypass(url, depth=0, max_depth=6, visited=None):
+def bypass(url, depth=0, max_depth=4, visited=None):
     if visited is None:
         visited = set()
 
@@ -292,7 +310,7 @@ def bypass(url, depth=0, max_depth=6, visited=None):
     )
     if loc_match:
         target = loc_match.group(1).replace("\\/", "/")
-        if target.startswith("http") and not is_shortener(target) and not is_asset(target):
+        if target.startswith("http") and not is_asset(target):
             log(f"FINAL (window.location.href): {target}")
             return {"success": True, "url": target, "method": "window-location", "logs": logs}
 
@@ -305,9 +323,8 @@ def bypass(url, depth=0, max_depth=6, visited=None):
             log(f"FINAL (M2 decode): {decoded}")
             return {"success": True, "url": decoded, "method": "m2-decode", "logs": logs}
     else:
-        log("M2() tidak ketemu di HTML")
+        log("M2() tidak ada")
 
-    # === PRIORITAS 1.6: Field 5np_c5a langsung (rot_url) ===
     raw_rot = extract_m2_field_raw(html)
     if raw_rot:
         clean = raw_rot.replace("\\/", "/")
@@ -318,7 +335,7 @@ def bypass(url, depth=0, max_depth=6, visited=None):
             return {"success": True, "url": decoded, "method": "rot-field", "logs": logs}
 
     # === PRIORITAS 2: redirect final ===
-    if final_url != url and not is_shortener(final_url) and not is_asset(final_url):
+    if final_url != url and not is_shortener(final_url) and not is_asset(final_url) and not has_fragment(final_url):
         log(f"FINAL via redirect: {final_url}")
         return {"success": True, "url": final_url, "method": "redirect-final", "logs": logs}
 
@@ -326,12 +343,11 @@ def bypass(url, depth=0, max_depth=6, visited=None):
     for pattern in [
         r'location\.replace\(["\'](https?:[^"\']+)["\']\)',
         r'location\.assign\(["\'](https?:[^"\']+)["\']\)',
-        r'["\'](?:url|link|target|redirect|real_url|final_url|destination)["\']\s*[:=]\s*["\'](https?:[^"\']+)["\']',
     ]:
         m = re.search(pattern, html, re.I)
         if m:
             js_target = m.group(1).replace("\\/", "/")
-            if js_target.startswith("http") and not is_shortener(js_target) and not is_asset(js_target):
+            if js_target.startswith("http") and not is_asset(js_target):
                 log(f"FINAL (JS var): {js_target}")
                 return {"success": True, "url": js_target, "method": "js-var", "logs": logs}
 
@@ -343,9 +359,21 @@ def bypass(url, depth=0, max_depth=6, visited=None):
         return {"success": True, "url": final_candidates[0], "method": "html-url",
                 "candidates": final_candidates[:5], "logs": logs}
 
-    # === PRIORITAS 5: rekursif shortener ===
-    shorteners_in_html = [u for u in all_urls if is_shortener(u) and u not in visited and u != url]
-    for s in shorteners_in_html[:3]:
+    # === PRIORITAS 5: rekursif shortener (HANYA domain shortener, bukan fragment) ===
+    shorteners_in_html = []
+    for u in all_urls:
+        if not is_shortener(u):
+            continue
+        if u in visited or u == url:
+            continue
+        if has_fragment(u):
+            continue
+        # skip redirect.php yang sama
+        if "redirect.php" in u and "redirect.php" in url:
+            continue
+        shorteners_in_html.append(u)
+
+    for s in shorteners_in_html[:2]:
         log(f"Shortener lain: {s}, rekursif...")
         sub = bypass(s, depth + 1, max_depth, visited)
         if sub.get("success"):
@@ -382,21 +410,8 @@ def bypass(url, depth=0, max_depth=6, visited=None):
                     if decoded.startswith("http"):
                         return {"success": True, "url": decoded, "method": f"{method}-m2", "logs": logs}
 
-                raw_rot2 = extract_m2_field_raw(txt)
-                if raw_rot2:
-                    clean = re.sub(r'\[[^\]]+\]', '', raw_rot2.replace("\\/", "/"))
-                    decoded = decode_obfuscated_string(clean)
-                    if decoded.startswith("http"):
-                        return {"success": True, "url": decoded, "method": f"{method}-rot", "logs": logs}
-
-                if fu != final_url and not is_shortener(fu) and not is_asset(fu):
+                if fu != final_url and not is_shortener(fu) and not is_asset(fu) and not has_fragment(fu):
                     return {"success": True, "url": fu, "method": f"{method}-redirect", "logs": logs}
-
-                if is_shortener(fu) and fu not in visited:
-                    sub = bypass(fu, depth + 1, max_depth, visited)
-                    if sub.get("success"):
-                        sub["logs"] = logs + sub.get("logs", [])
-                        return sub
 
                 found = [u for u in extract_urls(txt.replace("\\/", "/")) if is_candidate(u)]
                 if found:
