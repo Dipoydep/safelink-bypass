@@ -6,7 +6,6 @@ Jalan di Termux, pake IP HP -> lolos Cloudflare.
 import sys
 import json
 import re
-import time
 import random
 import base64
 import requests
@@ -32,10 +31,13 @@ def fetch(url, session=None, allow_redirects=True):
         return 0, url, f"ERROR: {e}"
 
 
-def post(url, session=None, json_data=None, data=None):
+def post(url, session=None, json_data=None, data=None, extra_headers=None):
     s = session or requests.Session()
+    h = dict(HEADERS)
+    if extra_headers:
+        h.update(extra_headers)
     try:
-        r = s.post(url, headers=HEADERS, timeout=20, json=json_data, data=data)
+        r = s.post(url, headers=h, timeout=20, json=json_data, data=data)
         return r.status_code, r.url, r.text
     except Exception as e:
         return 0, url, f"ERROR: {e}"
@@ -55,36 +57,22 @@ def build_token(session, html, verbose=True):
             break
 
     if xsrf:
-        log(f"[4] XSRF-TOKEN: {xsrf[:40]}...")
+        log(f"[4] XSRF-TOKEN (raw): {xsrf[:60]}...")
+        log(f"    Panjang: {len(xsrf)}")
     else:
-        log(f"[4] XSRF-TOKEN gak ada di cookie, cari di HTML")
-        m = re.search(r'name="csrf-token"\s+content="([^"]+)"', html)
-        if m:
-            xsrf = m.group(1)
-            log(f"    Ketemu di meta: {xsrf[:40]}...")
-        else:
-            log(f"    XSRF-TOKEN gak ketemu sama sekali")
-            xsrf = ""
+        log(f"[4] XSRF-TOKEN gak ada di cookie")
+        xsrf = ""
 
-    # Bikin fingerprint sederhana
-    fp_parts = [
-        f"webgl:Google|{random.randint(100, 999)}",
-        f"audio:{random.random():.12f}",
-        f"canvas:abc{random.randint(100, 999)}",
-        f"fonts:24/24",
-        f"system:{random.randint(2, 16)}CPU",
-    ]
-    fingerprint = "||".join(fp_parts)
+    # Fingerprint SANGAT sederhana — 1 karakter aja
+    fingerprint = "a"
     fp_b64 = base64.b64encode(fingerprint.encode()).decode()
+    u = "#" + fp_b64
 
-    # _token = xsrf + "#" + fp_b64 (dipotong sampe 128 karakter)
-    if xsrf:
-        max_xsrf_len = max(0, 128 - len(fp_b64) - 1)
-        token = xsrf[:max_xsrf_len] + "#" + fp_b64
-    else:
-        token = "#" + fp_b64
+    # _token = xsrf (dipotong sampe 128 - len(u)) + u
+    max_xsrf = max(0, 128 - len(u))
+    token = xsrf[:max_xsrf] + u
 
-    log(f"[5] _token: {token[:60]}...")
+    log(f"[5] _token (panjang {len(token)}): {token[:60]}...")
     return token
 
 
@@ -129,15 +117,23 @@ def bypass_safelink(url, verbose=True):
     # STEP 3.5: Fetch halaman khaddavi (biar cookie XSRF ke-set)
     st, _, kh_html = fetch(kh_url, session)
     log(f"[3.5] Fetch khaddavi -> {st}")
-
-    # Cek cookie session
     log(f"    Cookies: {[c.name for c in session.cookies]}")
 
     # STEP 4-5: Bikin _token
     token = build_token(session, kh_html, verbose)
 
     # STEP 6: /api/session
-    st, _, body = post(f"{base}/api/session", session, json_data={"_token": token})
+    extra_headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": base,
+        "Referer": kh_url,
+    }
+    st, _, body = post(
+        f"{base}/api/session",
+        session,
+        json_data={"_token": token},
+        extra_headers=extra_headers,
+    )
     log(f"[6] /api/session -> {st}")
     log(f"    {body[:200]}")
 
@@ -146,6 +142,7 @@ def bypass_safelink(url, verbose=True):
         f"{base}/api/go",
         session,
         json_data={"key": 1, "size": "1000.2000", "ado": None},
+        extra_headers=extra_headers,
     )
     log(f"[7] /api/go -> {st}")
     log(f"    {body[:300]}")
