@@ -4,7 +4,9 @@ import re
 import base64
 import binascii
 from urllib.parse import urlparse, parse_qs
-import cloudscraper
+import urllib.request
+import urllib.error
+import ssl
 
 HEADERS = {
     "User-Agent": (
@@ -17,9 +19,33 @@ HEADERS = {
     "Referer": "https://www.google.com/",
 }
 
-scraper = cloudscraper.create_scraper(
-    browser={"browser": "chrome", "platform": "android", "mobile": True}
-)
+# SSL context (bypass cert issue)
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE
+
+
+def http_get(url, timeout=20):
+    req = urllib.request.Request(url, headers=HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
+            return r.status, r.geturl(), r.read().decode("utf-8", "ignore")
+    except urllib.error.HTTPError as e:
+        return e.code, url, e.read().decode("utf-8", "ignore")
+    except Exception as e:
+        return 0, url, f"ERROR: {e}"
+
+
+def http_post(url, data, timeout=20):
+    body = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(url, data=body, headers=HEADERS, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
+            return r.status, r.geturl(), r.read().decode("utf-8", "ignore")
+    except urllib.error.HTTPError as e:
+        return e.code, url, e.read().decode("utf-8", "ignore")
+    except Exception as e:
+        return 0, url, f"ERROR: {e}"
 
 
 def b64_decode(s):
@@ -132,13 +158,12 @@ def bypass(url):
 
     log(f"Target: {url}")
 
-    r = scraper.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
-    log(f"HTTP {r.status_code} -> {r.url}")
+    status, final_url, html = http_get(url)
+    log(f"HTTP {status} -> {final_url}")
 
-    for h in r.history:
-        log(f"redirect: {h.status_code} {h.headers.get('Location','')}")
+    if status == 0:
+        return {"success": False, "error": "Fetch gagal", "logs": logs, "raw": html[:500]}
 
-    html = r.text
     log(f"HTML size: {len(html)}")
 
     log("Cari hidden payload...")
@@ -158,19 +183,20 @@ def bypass(url):
     log(f"Endpoints: {endpoints}")
     log(f"Tokens: {list(tokens.keys())}")
 
-    base = f"{urlparse(r.url).scheme}://{urlparse(r.url).netloc}"
+    base = f"{urlparse(final_url).scheme}://{urlparse(final_url).netloc}"
 
     for ep in endpoints[:5]:
         full = ep if ep.startswith("http") else base + ep
         for method in ("POST", "GET"):
             try:
                 if method == "POST":
-                    res = scraper.post(full, headers=HEADERS, data=tokens, timeout=20)
+                    st, fu, txt = http_post(full, tokens)
                 else:
-                    res = scraper.get(full, headers=HEADERS, params=tokens, timeout=20)
-                log(f"{method} {full} -> {res.status_code}")
+                    qs = urllib.parse.urlencode(tokens)
+                    st, fu, txt = http_get(full + ("?" + qs if qs else ""))
+                log(f"{method} {full} -> {st}")
 
-                found = find_all_hidden(res.text)
+                found = find_all_hidden(txt)
                 if found:
                     return {
                         "success": True,
@@ -180,7 +206,7 @@ def bypass(url):
                     }
 
                 try:
-                    j = res.json()
+                    j = json.loads(txt)
                     for k in ("url", "link", "target", "redirect"):
                         if k in j and isinstance(j[k], str) and j[k].startswith("http"):
                             return {
@@ -235,9 +261,3 @@ class handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(data, indent=2, ensure_ascii=False).encode())
-
-
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1:
-        print(json.dumps(bypass(sys.argv[1]), indent=2, ensure_ascii=False))
