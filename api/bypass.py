@@ -3,7 +3,7 @@ import json
 import re
 import base64
 import binascii
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 import urllib.request
 import urllib.error
 import ssl
@@ -19,10 +19,24 @@ HEADERS = {
     "Referer": "https://www.google.com/",
 }
 
-# SSL context (bypass cert issue)
 CTX = ssl.create_default_context()
 CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
+
+# Cuma blacklist — bukan whitelist
+SHORTENER_DOMAINS = [
+    "sfl.gl", "safelink", "khaddavi", "comun.id",
+    "bit.ly", "tinyurl", "shorturl", "s.id", "tiny.cc",
+    "rebrand.ly", "cutt.ly", "shorte.st", "adf.ly",
+]
+
+# Asset / tracker yang harus di-skip
+ASSET_BLACKLIST = [
+    "google", "gstatic", "cloudflare", "cdn.",
+    "jquery", "bootstrap", "fontawesome", "analytics",
+    "doubleclick", "facebook", "twitter", "whatsapp",
+    "schema.org", "w.org", "wp.com", "gravatar",
+]
 
 
 def http_get(url, timeout=20):
@@ -37,7 +51,7 @@ def http_get(url, timeout=20):
 
 
 def http_post(url, data, timeout=20):
-    body = urllib.parse.urlencode(data).encode()
+    body = urlencode(data).encode()
     req = urllib.request.Request(url, data=body, headers=HEADERS, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
@@ -66,14 +80,21 @@ def extract_urls(text):
     return re.findall(r'https?://[^\s"\'<>\\]+', text)
 
 
+def is_shortener(url):
+    return any(d in url.lower() for d in SHORTENER_DOMAINS)
+
+
+def is_asset(url):
+    return any(d in url.lower() for d in ASSET_BLACKLIST)
+
+
+def is_candidate(url):
+    """URL kandidat final: bukan shortener, bukan asset."""
+    return not is_shortener(url) and not is_asset(url)
+
+
 def filter_real(urls):
-    blacklist = [
-        "sfl.gl", "safelink", "khaddavi", "google", "gstatic", "cloudflare",
-        "cdn.", "jquery", "bootstrap", "fontawesome", "analytics",
-        "doubleclick", "facebook", "twitter", "whatsapp", "schema.org",
-        "w.org", "wp.com", "gravatar",
-    ]
-    return [u for u in urls if not any(b in u.lower() for b in blacklist)]
+    return [u for u in urls if is_candidate(u)]
 
 
 def find_all_hidden(html):
@@ -82,24 +103,24 @@ def find_all_hidden(html):
     for blob in re.findall(r'[A-Za-z0-9+/=]{30,}', html):
         dec = b64_decode(blob)
         if dec and "http" in dec:
-            results.extend(filter_real(extract_urls(dec)))
+            results.extend(extract_urls(dec))
 
     for blob in re.findall(r'[0-9a-fA-F]{30,}', html):
         dec = hex_decode(blob)
         if dec and "http" in dec:
-            results.extend(filter_real(extract_urls(dec)))
+            results.extend(extract_urls(dec))
 
     for m in re.findall(r'(?:var|let|const)\s+\w+\s*=\s*["\'](https?://[^"\']+)["\']', html):
         results.append(m)
 
     for m in re.findall(
-        r'["\'](?:url|link|target|redirect|destination|href)["\']\s*:\s*["\'](https?://[^"\']+)["\']',
+        r'["\'](?:url|link|target|redirect|destination|href|real_url|final_url)["\']\s*:\s*["\'](https?://[^"\']+)["\']',
         html, re.I
     ):
         results.append(m)
 
     for m in re.findall(
-        r'data-(?:url|href|link|target|redirect|dest)=["\'](https?://[^"\']+)["\']',
+        r'data-(?:url|href|link|target|redirect|dest|real)=["\'](https?://[^"\']+)["\']',
         html, re.I
     ):
         results.append(m)
@@ -111,8 +132,7 @@ def find_all_hidden(html):
         results.append(m)
 
     for m in re.findall(r'<a[^>]+href=["\'](https?://[^"\']+)["\']', html, re.I):
-        if not any(x in m for x in ["khaddavi", "sfl.gl", "safelink"]):
-            results.append(m)
+        results.append(m)
 
     seen = set()
     final = []
@@ -130,8 +150,10 @@ def find_step_endpoints(html):
     for m in re.findall(r'<form[^>]+action=["\']([^"\']+)["\']', html, re.I):
         endpoints.append(m)
     for m in re.findall(r'["\'](/[a-z0-9_\-]+/[a-z0-9_\-/]+)["\']', html, re.I):
-        if any(k in m.lower() for k in ["api", "go", "step", "link", "redirect", "get"]):
+        if any(k in m.lower() for k in ["api", "go", "step", "link", "redirect", "get", "ready"]):
             endpoints.append(m)
+    for m in re.findall(r'["\'](https?://[^"\']*?/(?:go|ready|redirect|link|get)[^"\']*)["\']', html, re.I):
+        endpoints.append(m)
     return list(set(endpoints))
 
 
@@ -150,13 +172,34 @@ def find_tokens(html):
     return tokens
 
 
-def bypass(url):
+def find_ready_url(html):
+    m = re.search(r'(https?://sfl\.gl/ready/go\?t=[A-Za-z0-9]+)', html)
+    if m:
+        return m.group(1)
+    m = re.search(r'["\'](/ready/go\?t=[A-Za-z0-9]+)["\']', html)
+    if m:
+        return "https://sfl.gl" + m.group(1)
+    return None
+
+
+def bypass(url, depth=0, max_depth=8, visited=None):
+    if visited is None:
+        visited = set()
+
+    if url in visited:
+        return {"success": False, "error": "Loop detected", "url": url, "logs": []}
+
+    visited.add(url)
+
+    if depth >= max_depth:
+        return {"success": False, "error": "Max depth reached", "url": url, "logs": []}
+
     logs = []
 
     def log(m):
-        logs.append(str(m))
+        logs.append("  " * depth + str(m))
 
-    log(f"Target: {url}")
+    log(f"[d={depth}] {url}")
 
     status, final_url, html = http_get(url)
     log(f"HTTP {status} -> {final_url}")
@@ -164,78 +207,130 @@ def bypass(url):
     if status == 0:
         return {"success": False, "error": "Fetch gagal", "logs": logs, "raw": html[:500]}
 
-    log(f"HTML size: {len(html)}")
+    log(f"HTML: {len(html)} bytes")
 
+    # Kalau redirect udah keluar dari shortener = final
+    if final_url != url and not is_shortener(final_url) and not is_asset(final_url):
+        log(f"FINAL via redirect: {final_url}")
+        return {"success": True, "url": final_url, "method": "redirect-final", "logs": logs}
+
+    # KHUSUS ready/go
+    if "ready/go" in final_url or "/ready/" in final_url:
+        log("Halaman ready — cari payload...")
+
+        hidden = [u for u in find_all_hidden(html) if is_candidate(u)]
+        for u in hidden:
+            log(f"Kandidat final: {u}")
+            return {"success": True, "url": u, "method": "ready-final", "candidates": hidden[:10], "logs": logs}
+
+        endpoints = find_step_endpoints(html)
+        tokens = find_tokens(html)
+        log(f"Ready endpoints: {endpoints}")
+
+        base = f"{urlparse(final_url).scheme}://{urlparse(final_url).netloc}"
+        for ep in endpoints[:10]:
+            full = ep if ep.startswith("http") else base + ep
+            for method in ("POST", "GET"):
+                try:
+                    if method == "POST":
+                        st, fu, txt = http_post(full, tokens)
+                    else:
+                        st, fu, txt = http_get(full + ("?" + urlencode(tokens) if tokens else ""))
+                    log(f"  {method} {full} -> {st} -> {fu}")
+
+                    if fu != final_url and not is_shortener(fu) and not is_asset(fu):
+                        return {"success": True, "url": fu, "method": f"ready-{method}-redirect", "logs": logs}
+
+                    found = [u for u in find_all_hidden(txt) if is_candidate(u)]
+                    if found:
+                        return {"success": True, "url": found[0], "method": f"ready-{method}-body", "candidates": found[:10], "logs": logs}
+                except Exception as e:
+                    log(f"  err: {e}")
+
+        if hidden:
+            return {"success": True, "url": hidden[0], "method": "ready-fallback", "candidates": hidden[:10], "logs": logs}
+
+    # Ready URL di HTML
+    ready_url = find_ready_url(html)
+    if ready_url:
+        log(f"Ketemu ready URL: {ready_url}")
+        sub = bypass(ready_url, depth + 1, max_depth, visited)
+        if sub.get("success"):
+            sub["logs"] = logs + sub.get("logs", [])
+            return sub
+
+    # Hidden payload
     log("Cari hidden payload...")
     hidden = find_all_hidden(html)
-    if hidden:
-        log(f"Ketemu {len(hidden)} kandidat")
-        return {
-            "success": True,
-            "url": hidden[0],
-            "method": "hidden-in-html",
-            "candidates": hidden[:10],
-            "logs": logs,
-        }
+    candidates = [u for u in hidden if is_candidate(u)]
 
+    if candidates:
+        log(f"Kandidat final: {len(candidates)}")
+        return {"success": True, "url": candidates[0], "method": "hidden-final", "candidates": candidates[:10], "logs": logs}
+
+    # Rekursif kalau ketemu shortener lain
+    shorteners_in_html = [u for u in hidden if is_shortener(u) and u not in visited]
+    for s in shorteners_in_html[:3]:
+        log(f"Shortener lain: {s}, rekursif...")
+        sub = bypass(s, depth + 1, max_depth, visited)
+        if sub.get("success"):
+            sub["logs"] = logs + sub.get("logs", [])
+            return sub
+
+    # Endpoints
     endpoints = find_step_endpoints(html)
     tokens = find_tokens(html)
     log(f"Endpoints: {endpoints}")
-    log(f"Tokens: {list(tokens.keys())}")
 
     base = f"{urlparse(final_url).scheme}://{urlparse(final_url).netloc}"
 
-    for ep in endpoints[:5]:
+    for ep in endpoints[:8]:
         full = ep if ep.startswith("http") else base + ep
         for method in ("POST", "GET"):
             try:
                 if method == "POST":
                     st, fu, txt = http_post(full, tokens)
                 else:
-                    qs = urllib.parse.urlencode(tokens)
-                    st, fu, txt = http_get(full + ("?" + qs if qs else ""))
-                log(f"{method} {full} -> {st}")
+                    st, fu, txt = http_get(full + ("?" + urlencode(tokens) if tokens else ""))
+                log(f"{method} {full} -> {st} -> {fu}")
 
-                found = find_all_hidden(txt)
+                if fu != final_url and not is_shortener(fu) and not is_asset(fu):
+                    return {"success": True, "url": fu, "method": f"{method}-redirect", "logs": logs}
+
+                if is_shortener(fu) and fu not in visited:
+                    log(f"Rekursif ke: {fu}")
+                    sub = bypass(fu, depth + 1, max_depth, visited)
+                    if sub.get("success"):
+                        sub["logs"] = logs + sub.get("logs", [])
+                        return sub
+
+                found = [u for u in find_all_hidden(txt) if is_candidate(u)]
                 if found:
-                    return {
-                        "success": True,
-                        "url": found[0],
-                        "method": f"{method}-{ep}",
-                        "logs": logs,
-                    }
+                    return {"success": True, "url": found[0], "method": f"{method}-body", "candidates": found[:10], "logs": logs}
 
-                try:
-                    j = json.loads(txt)
-                    for k in ("url", "link", "target", "redirect"):
-                        if k in j and isinstance(j[k], str) and j[k].startswith("http"):
-                            return {
-                                "success": True,
-                                "url": j[k],
-                                "method": f"{method}-json",
-                                "logs": logs,
-                            }
-                except Exception:
-                    pass
+                short_in_body = [u for u in find_all_hidden(txt) if is_shortener(u) and u not in visited]
+                if short_in_body:
+                    log(f"Shortener di body: {short_in_body[0]}, rekursif...")
+                    sub = bypass(short_in_body[0], depth + 1, max_depth, visited)
+                    if sub.get("success"):
+                        sub["logs"] = logs + sub.get("logs", [])
+                        return sub
+
+                rdy = find_ready_url(txt)
+                if rdy and rdy not in visited:
+                    log(f"Ready URL di body: {rdy}")
+                    sub = bypass(rdy, depth + 1, max_depth, visited)
+                    if sub.get("success"):
+                        sub["logs"] = logs + sub.get("logs", [])
+                        return sub
             except Exception as e:
                 log(f"{method} err: {e}")
 
     all_urls = filter_real(extract_urls(html))
     if all_urls:
-        return {
-            "success": True,
-            "url": all_urls[0],
-            "method": "fallback",
-            "candidates": all_urls[:10],
-            "logs": logs,
-        }
+        return {"success": True, "url": all_urls[0], "method": "fallback", "candidates": all_urls[:10], "logs": logs}
 
-    return {
-        "success": False,
-        "error": "Gagal detect",
-        "logs": logs,
-        "endpoints": endpoints,
-    }
+    return {"success": False, "error": "Gagal detect", "logs": logs, "endpoints": endpoints}
 
 
 class handler(BaseHTTPRequestHandler):
