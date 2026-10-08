@@ -23,19 +23,19 @@ CTX = ssl.create_default_context()
 CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
 
-# Cuma blacklist — bukan whitelist
 SHORTENER_DOMAINS = [
-    "sfl.gl", "safelink", "khaddavi", "comun.id",
+    "sfl.gl", "safelink", "safelinku", "khaddavi", "comun.id",
     "bit.ly", "tinyurl", "shorturl", "s.id", "tiny.cc",
     "rebrand.ly", "cutt.ly", "shorte.st", "adf.ly",
 ]
 
-# Asset / tracker yang harus di-skip
 ASSET_BLACKLIST = [
     "google", "gstatic", "cloudflare", "cdn.",
     "jquery", "bootstrap", "fontawesome", "analytics",
     "doubleclick", "facebook", "twitter", "whatsapp",
     "schema.org", "w.org", "wp.com", "gravatar",
+    "generatepress", "wordpress.org", "themeforest",
+    "elementor", "w3.org", "googleapis",
 ]
 
 
@@ -89,12 +89,7 @@ def is_asset(url):
 
 
 def is_candidate(url):
-    """URL kandidat final: bukan shortener, bukan asset."""
     return not is_shortener(url) and not is_asset(url)
-
-
-def filter_real(urls):
-    return [u for u in urls if is_candidate(u)]
 
 
 def find_all_hidden(html):
@@ -172,17 +167,7 @@ def find_tokens(html):
     return tokens
 
 
-def find_ready_url(html):
-    m = re.search(r'(https?://sfl\.gl/ready/go\?t=[A-Za-z0-9]+)', html)
-    if m:
-        return m.group(1)
-    m = re.search(r'["\'](/ready/go\?t=[A-Za-z0-9]+)["\']', html)
-    if m:
-        return "https://sfl.gl" + m.group(1)
-    return None
-
-
-def bypass(url, depth=0, max_depth=8, visited=None):
+def bypass(url, depth=0, max_depth=6, visited=None):
     if visited is None:
         visited = set()
 
@@ -209,67 +194,44 @@ def bypass(url, depth=0, max_depth=8, visited=None):
 
     log(f"HTML: {len(html)} bytes")
 
-    # Kalau redirect udah keluar dari shortener = final
+    # === PRIORITAS 1: window.location.href ===
+    loc_match = re.search(
+        r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']',
+        html
+    )
+    if loc_match:
+        target = loc_match.group(1).replace("\\/", "/")
+        if target.startswith("http"):
+            log(f"FINAL (window.location.href): {target}")
+            return {"success": True, "url": target, "method": "window-location", "logs": logs}
+
+    # === PRIORITAS 2: redirect final ===
     if final_url != url and not is_shortener(final_url) and not is_asset(final_url):
         log(f"FINAL via redirect: {final_url}")
         return {"success": True, "url": final_url, "method": "redirect-final", "logs": logs}
 
-    # KHUSUS ready/go
-    if "ready/go" in final_url or "/ready/" in final_url:
-        log("Halaman ready — cari payload...")
+    # === PRIORITAS 3: JS var ===
+    for pattern in [
+        r'location\.replace\(["\'](https?:[^"\']+)["\']\)',
+        r'location\.assign\(["\'](https?:[^"\']+)["\']\)',
+        r'["\'](?:url|link|target|redirect|real_url|final_url|destination)["\']\s*[:=]\s*["\'](https?:[^"\']+)["\']',
+    ]:
+        m = re.search(pattern, html, re.I)
+        if m:
+            js_target = m.group(1).replace("\\/", "/")
+            if js_target.startswith("http") and not is_shortener(js_target) and not is_asset(js_target):
+                log(f"FINAL (JS var): {js_target}")
+                return {"success": True, "url": js_target, "method": "js-var", "logs": logs}
 
-        hidden = [u for u in find_all_hidden(html) if is_candidate(u)]
-        for u in hidden:
-            log(f"Kandidat final: {u}")
-            return {"success": True, "url": u, "method": "ready-final", "candidates": hidden[:10], "logs": logs}
+    # === PRIORITAS 4: URL final di HTML ===
+    all_urls = extract_urls(html.replace("\\/", "/"))
+    final_candidates = [u for u in all_urls if is_candidate(u)]
+    if final_candidates:
+        log(f"Kandidat final: {final_candidates[0]}")
+        return {"success": True, "url": final_candidates[0], "method": "html-url", "candidates": final_candidates[:5], "logs": logs}
 
-        endpoints = find_step_endpoints(html)
-        tokens = find_tokens(html)
-        log(f"Ready endpoints: {endpoints}")
-
-        base = f"{urlparse(final_url).scheme}://{urlparse(final_url).netloc}"
-        for ep in endpoints[:10]:
-            full = ep if ep.startswith("http") else base + ep
-            for method in ("POST", "GET"):
-                try:
-                    if method == "POST":
-                        st, fu, txt = http_post(full, tokens)
-                    else:
-                        st, fu, txt = http_get(full + ("?" + urlencode(tokens) if tokens else ""))
-                    log(f"  {method} {full} -> {st} -> {fu}")
-
-                    if fu != final_url and not is_shortener(fu) and not is_asset(fu):
-                        return {"success": True, "url": fu, "method": f"ready-{method}-redirect", "logs": logs}
-
-                    found = [u for u in find_all_hidden(txt) if is_candidate(u)]
-                    if found:
-                        return {"success": True, "url": found[0], "method": f"ready-{method}-body", "candidates": found[:10], "logs": logs}
-                except Exception as e:
-                    log(f"  err: {e}")
-
-        if hidden:
-            return {"success": True, "url": hidden[0], "method": "ready-fallback", "candidates": hidden[:10], "logs": logs}
-
-    # Ready URL di HTML
-    ready_url = find_ready_url(html)
-    if ready_url:
-        log(f"Ketemu ready URL: {ready_url}")
-        sub = bypass(ready_url, depth + 1, max_depth, visited)
-        if sub.get("success"):
-            sub["logs"] = logs + sub.get("logs", [])
-            return sub
-
-    # Hidden payload
-    log("Cari hidden payload...")
-    hidden = find_all_hidden(html)
-    candidates = [u for u in hidden if is_candidate(u)]
-
-    if candidates:
-        log(f"Kandidat final: {len(candidates)}")
-        return {"success": True, "url": candidates[0], "method": "hidden-final", "candidates": candidates[:10], "logs": logs}
-
-    # Rekursif kalau ketemu shortener lain
-    shorteners_in_html = [u for u in hidden if is_shortener(u) and u not in visited]
+    # === PRIORITAS 5: rekursif shortener ===
+    shorteners_in_html = [u for u in all_urls if is_shortener(u) and u not in visited and u != url]
     for s in shorteners_in_html[:3]:
         log(f"Shortener lain: {s}, rekursif...")
         sub = bypass(s, depth + 1, max_depth, visited)
@@ -277,7 +239,7 @@ def bypass(url, depth=0, max_depth=8, visited=None):
             sub["logs"] = logs + sub.get("logs", [])
             return sub
 
-    # Endpoints
+    # === PRIORITAS 6: endpoint POST/GET ===
     endpoints = find_step_endpoints(html)
     tokens = find_tokens(html)
     log(f"Endpoints: {endpoints}")
@@ -294,41 +256,26 @@ def bypass(url, depth=0, max_depth=8, visited=None):
                     st, fu, txt = http_get(full + ("?" + urlencode(tokens) if tokens else ""))
                 log(f"{method} {full} -> {st} -> {fu}")
 
+                loc_m = re.search(r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']', txt)
+                if loc_m:
+                    target = loc_m.group(1).replace("\\/", "/")
+                    if target.startswith("http"):
+                        return {"success": True, "url": target, "method": f"{method}-window-location", "logs": logs}
+
                 if fu != final_url and not is_shortener(fu) and not is_asset(fu):
                     return {"success": True, "url": fu, "method": f"{method}-redirect", "logs": logs}
 
                 if is_shortener(fu) and fu not in visited:
-                    log(f"Rekursif ke: {fu}")
                     sub = bypass(fu, depth + 1, max_depth, visited)
                     if sub.get("success"):
                         sub["logs"] = logs + sub.get("logs", [])
                         return sub
 
-                found = [u for u in find_all_hidden(txt) if is_candidate(u)]
+                found = [u for u in extract_urls(txt.replace("\\/", "/")) if is_candidate(u)]
                 if found:
-                    return {"success": True, "url": found[0], "method": f"{method}-body", "candidates": found[:10], "logs": logs}
-
-                short_in_body = [u for u in find_all_hidden(txt) if is_shortener(u) and u not in visited]
-                if short_in_body:
-                    log(f"Shortener di body: {short_in_body[0]}, rekursif...")
-                    sub = bypass(short_in_body[0], depth + 1, max_depth, visited)
-                    if sub.get("success"):
-                        sub["logs"] = logs + sub.get("logs", [])
-                        return sub
-
-                rdy = find_ready_url(txt)
-                if rdy and rdy not in visited:
-                    log(f"Ready URL di body: {rdy}")
-                    sub = bypass(rdy, depth + 1, max_depth, visited)
-                    if sub.get("success"):
-                        sub["logs"] = logs + sub.get("logs", [])
-                        return sub
+                    return {"success": True, "url": found[0], "method": f"{method}-body", "candidates": found[:5], "logs": logs}
             except Exception as e:
                 log(f"{method} err: {e}")
-
-    all_urls = filter_real(extract_urls(html))
-    if all_urls:
-        return {"success": True, "url": all_urls[0], "method": "fallback", "candidates": all_urls[:10], "logs": logs}
 
     return {"success": False, "error": "Gagal detect", "logs": logs, "endpoints": endpoints}
 
